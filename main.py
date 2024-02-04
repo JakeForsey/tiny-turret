@@ -7,66 +7,67 @@ import cv2
 import serial
 import torch
 
-ONE_SECOND = 1
-ONE_MILLISECOND = ONE_SECOND / 1000
-
 BGR_RED = (0, 0, 255)
 BGR_GREEN = (0, 255, 0)
 BGR_BLUE = (255, 0, 0)
 
 CAMERA_ID = int(os.getenv("CAMERA_ID", "0"))
-CLASS_ID = int(os.getenv("CLASS_ID", "41"))  # 0: person, 41: cup
-SHOW = int(os.getenv("SHOW", "1"))
+# 0: person, 39: bottle, 40: wine glass, 41: cup, 46: banana, 67: cell phone, 65: remote, 76: scissors
+CLASS_ID = int(os.getenv("CLASS_ID", "41"))
+MODEL_SIZE = os.getenv("MODEL_SIZE", "s")
+DEBUG = int(os.getenv("DEBUG", "1"))
 WIDTH = int(os.getenv("WIDTH", "320"))
 HEIGHT = int(os.getenv("HEIGHT", "240"))
 PORT = int(os.getenv("PORT", "0"))
 HERTZ = int(os.getenv("HERTZ", "50"))
 
-class PWMPinWidth:
+class PWMPin:
     def __init__(self, pin, pulse_width):
         self.pin = pin
         self.pulse_width = pulse_width
 
 def write(ser, port, value):
+    # Write to port:
+    #  @00Pp00 -> set all pins low on port 'p'
+    #  @00Ppff -> set all pins high on port 'p'
+    #  @00Pp01 -> set pin 0 high on port 'p'
     ser.write(f"@00P{port}{value:0>2x}\r".encode())
+
+def configure(ser, port, mode):
+    # Configure port:
+    #  @00Dp00 -> set port 'p' to write mode
+    #  @00Dpff -> set port 'p' to read mode
+    assert mode in ("w", "r")
+    ser.write(f"@00D{port}{'00' if mode == 'w' else 'ff'}\r".encode())
 
 def sleep_until(start, value):
     remaining = value - (time.time() - start)
     if remaining > 0: 
         time.sleep(remaining)
 
-def pwm(port, set_points, hertz):
-    # Commands:
-    #  Configure port:
-    #   @00Dp00 -> set port 'p' to write
-    #   @00Dpff -> set port 'p' to read
-    #  Write to port:
-    #   @00Pp00 -> set all pins low on port 'p'
-    #   @00Ppff -> set all pins high on port 'p'
-    #   @00Pp01 -> set pin 0 high on port 'p'
+def pwm(port, pwm_pins, hertz):
     step = (1 / hertz)
-    max_value = sum(2 ** sp.pin for sp in set_points)
-
+    max_value = sum(2 ** pp.pin for pp in pwm_pins)
     with serial.Serial("/dev/tty.usbmodem0275631", timeout=1) as ser:
-        ser.write(f"@00D{port}00\r".encode())
+        configure(ser, port, mode="w")
         while True:
             value = max_value
             start = time.time()
             write(ser, port, value)
 
-            grouped_set_points = defaultdict(list)
-            for set_point in set_points:
-                grouped_set_points[set_point.pulse_width].append(set_point.pin)
+            grouped = defaultdict(list)
+            for pwm_pin in pwm_pins:
+                grouped[pwm_pin.pulse_width].append(pwm_pin.pin)
 
-            for pulse_width, pins in sorted(grouped_set_points.items()):
+            for pulse_width, pins in sorted(grouped.items()):
                 sleep_until(start, pulse_width)                
                 value -= sum(2 ** pin for pin in pins)
                 write(ser, port, value)
 
             sleep_until(start, step)
 
-def init_model(class_id):
-    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+def init_model(class_id, model_size):
+    model = torch.hub.load('ultralytics/yolov5', f'yolov5{model_size}', pretrained=True)
     model.classes = [class_id]
     return model
 
@@ -77,10 +78,10 @@ def init_camera(camera_id, width, height):
     return camera
 
 def init_pwm(port, hertz):
-    set_points = [PWMPinWidth(0, 1 / 1000), PWMPinWidth(1, 1 / 1000)]
-    thread = threading.Thread(name="pwm", target=pwm, args=(port, set_points, hertz))
+    pwm_pins = [PWMPin(0, 1 / 1000), PWMPin(1, 1 / 1000)]
+    thread = threading.Thread(name="pwm", target=pwm, args=(port, pwm_pins, hertz))
     thread.start()
-    return set_points
+    return pwm_pins
 
 def get_frame(camera):
     return camera.read()[1] [..., ::-1] 
@@ -94,15 +95,12 @@ def get_target_position(model, frame):
     return int(y), int(x)
 
 def run():
-    model = init_model(CLASS_ID)
+    model = init_model(CLASS_ID, MODEL_SIZE)
     camera = init_camera(CAMERA_ID, WIDTH, HEIGHT)
-    pwm_set_points = init_pwm(PORT, HERTZ)
-
+    pwm_pins = init_pwm(PORT, HERTZ)
     cy, cx = HEIGHT // 2, WIDTH // 2
-    
     while True:
         start = time.time()
-
         frame = get_frame(camera)
         target_position = get_target_position(model, frame)
 
@@ -112,17 +110,17 @@ def run():
             dy, dx = cy - ty, cx - tx
 
             if dy > 0:
-                pwm_set_points[0].pulse_width = 0.5 / 1000
+                pwm_pins[0].pulse_width = 0.5 / 1000
             else:
-                pwm_set_points[0].pulse_width = 6. / 1000
+                pwm_pins[0].pulse_width = 6. / 1000
             if dx > 0:
-                pwm_set_points[1].pulse_width = 6. / 1000
+                pwm_pins[1].pulse_width = 6. / 1000
             else:
-                pwm_set_points[1].pulse_width = 0.5 / 1000
+                pwm_pins[1].pulse_width = 0.5 / 1000
 
-            print(f" {dy=}, {dx=}, pw0={pwm_set_points[0].pulse_width}, pw1={pwm_set_points[1].pulse_width}", end="")
+            print(f" {dy=}, {dx=}, pw0={pwm_pins[0].pulse_width}, pw1={pwm_pins[1].pulse_width}", end="")
             
-            if SHOW:
+            if DEBUG:
                 cv2.arrowedLine(frame[..., ::-1], (cx, cy), (tx, ty), BGR_GREEN, 1, tipLength=0.1)
                 cv2.arrowedLine(frame[..., ::-1], (cx, cy), (cx, ty), BGR_RED, 2, tipLength=0.1)
                 cv2.arrowedLine(frame[..., ::-1], (cx, cy), (tx, cy), BGR_BLUE, 2, tipLength=0.1)
@@ -133,7 +131,7 @@ def run():
         else:
             print(f"[NO LOCK ON]", end="")
 
-        if SHOW:
+        if DEBUG:
             cv2.imshow("image", frame[..., ::-1])
             if cv2.waitKey(10) & 0xFF == ord('q'):
                 break
@@ -146,10 +144,8 @@ def main():
     try:
         run()
     except Exception as e:
-        print(e)
         with serial.Serial("/dev/tty.usbmodem0275631", timeout=1) as ser:
-            for port in range(3):
-                write(ser, port, 0)
+            write(ser, PORT, 0)
 
 if __name__ == "__main__":
     main()
