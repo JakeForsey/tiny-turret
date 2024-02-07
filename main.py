@@ -72,7 +72,6 @@ def pwm(port, pwm_pins, hertz):
                 write(ser, port, value)
 
             sleep_until(start, step)
-            cycles += 1
 
 def init_model(class_id, model_size):
     model = torch.hub.load('ultralytics/yolov5', f'yolov5{model_size}', pretrained=True)
