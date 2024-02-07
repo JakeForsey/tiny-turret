@@ -1,6 +1,6 @@
 from collections import defaultdict
 import os
-import threading
+from multiprocessing import Process, Value
 import time
 
 import cv2
@@ -16,15 +16,15 @@ CAMERA_ID = int(os.getenv("CAMERA_ID", "0"))
 CLASS_ID = int(os.getenv("CLASS_ID", "41"))
 MODEL_SIZE = os.getenv("MODEL_SIZE", "s")
 DEBUG = int(os.getenv("DEBUG", "1"))
-WIDTH = int(os.getenv("WIDTH", "320"))
-HEIGHT = int(os.getenv("HEIGHT", "240"))
+WIDTH = int(os.getenv("WIDTH", "640"))
+HEIGHT = int(os.getenv("HEIGHT", "480"))
 PORT = int(os.getenv("PORT", "0"))
 HERTZ = int(os.getenv("HERTZ", "50"))
 
 class PWMPin:
     def __init__(self, pin, pulse_width):
         self.pin = pin
-        self.pulse_width = pulse_width
+        self.pulse_width = Value("d",pulse_width)
 
 def write(ser, port, value):
     # Write to port:
@@ -40,10 +40,17 @@ def configure(ser, port, mode):
     assert mode in ("w", "r")
     ser.write(f"@00D{port}{'00' if mode == 'w' else 'ff'}\r".encode())
 
+def sleep(duration):
+    # Accurate, but CPU intensive sleep function
+    now = time.perf_counter()
+    end = now + duration
+    while now < end:
+        now = time.perf_counter()
+
 def sleep_until(start, value):
     remaining = value - (time.time() - start)
     if remaining > 0: 
-        time.sleep(remaining)
+        sleep(remaining)
 
 def pwm(port, pwm_pins, hertz):
     step = (1 / hertz)
@@ -57,7 +64,7 @@ def pwm(port, pwm_pins, hertz):
 
             grouped = defaultdict(list)
             for pwm_pin in pwm_pins:
-                grouped[pwm_pin.pulse_width].append(pwm_pin.pin)
+                grouped[pwm_pin.pulse_width.value].append(pwm_pin.pin)
 
             for pulse_width, pins in sorted(grouped.items()):
                 sleep_until(start, pulse_width)                
@@ -65,22 +72,24 @@ def pwm(port, pwm_pins, hertz):
                 write(ser, port, value)
 
             sleep_until(start, step)
+            cycles += 1
 
 def init_model(class_id, model_size):
     model = torch.hub.load('ultralytics/yolov5', f'yolov5{model_size}', pretrained=True)
     model.classes = [class_id]
     return model
 
-def init_camera(camera_id, width, height):
+def init_camera(camera_id, height, width):
     camera = cv2.VideoCapture(camera_id)
-    assert camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     assert camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    assert camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     return camera
 
 def init_pwm(port, hertz):
     pwm_pins = [PWMPin(0, 1 / 1000), PWMPin(1, 1 / 1000)]
-    thread = threading.Thread(name="pwm", target=pwm, args=(port, pwm_pins, hertz))
-    thread.start()
+    process = Process(target=pwm, args=(port, pwm_pins, hertz))
+    process.daemon = True
+    process.start()
     return pwm_pins
 
 def get_frame(camera):
@@ -96,8 +105,8 @@ def get_target_position(model, frame):
 
 def run():
     model = init_model(CLASS_ID, MODEL_SIZE)
-    camera = init_camera(CAMERA_ID, WIDTH, HEIGHT)
     pwm_pins = init_pwm(PORT, HERTZ)
+    camera = init_camera(CAMERA_ID, HEIGHT, WIDTH)
     cy, cx = HEIGHT // 2, WIDTH // 2
     while True:
         start = time.time()
@@ -110,15 +119,15 @@ def run():
             dy, dx = cy - ty, cx - tx
 
             if dy > 0:
-                pwm_pins[0].pulse_width = 0.5 / 1000
+                pwm_pins[0].pulse_width.value = 0.5 / 1000
             else:
-                pwm_pins[0].pulse_width = 6. / 1000
+                pwm_pins[0].pulse_width.value = 6. / 1000
             if dx > 0:
-                pwm_pins[1].pulse_width = 6. / 1000
+                pwm_pins[1].pulse_width.value = 6. / 1000
             else:
-                pwm_pins[1].pulse_width = 0.5 / 1000
+                pwm_pins[1].pulse_width.value = 0.5 / 1000
 
-            print(f" {dy=}, {dx=}, pw0={pwm_pins[0].pulse_width}, pw1={pwm_pins[1].pulse_width}", end="")
+            print(f" {dy=}, {dx=}, pw0={pwm_pins[0].pulse_width.value}, pw1={pwm_pins[1].pulse_width.value}", end="")
             
             if DEBUG:
                 cv2.arrowedLine(frame[..., ::-1], (cx, cy), (tx, ty), BGR_GREEN, 1, tipLength=0.1)
