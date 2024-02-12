@@ -1,3 +1,4 @@
 *.pt
 venv/*
 runs/*
+output.mp4

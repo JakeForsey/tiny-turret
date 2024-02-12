@@ -1,3 +1,5 @@
 ultralytics
 torch
-serial
+pyserial
+opencv-python
+simple-pid
